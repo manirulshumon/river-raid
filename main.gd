@@ -1,5 +1,8 @@
 extends Node2D
-## Riverwing prototype v0.5.1 - special weapon pickups, stealth jet, stages, battlefields
+## Riverwing prototype v0.6 - sound, tablets/TV, on-screen weapon choice
+## (v0.6: music + sound effects; wider screens show more riverbank; TV remote and
+##  gamepad controls; SUPPLY READY button lets you choose the weapon; pause menu
+##  with sound settings and test tools; enemy bullets fly straight so you can dodge)
 ## (v0.5.1: weapon crates are earned: kill points fill the SUPPLY bar and a crate
 ##  is air-dropped when it is full; new weapon types unlock at score milestones)
 ## (v0.5: no permanent upgrades. Special weapons are crates on the river: fly over
@@ -333,6 +336,35 @@ var land_fired := false
 # input
 var touching := false
 var god := false
+var fire_latch := false         # TV remote: OK toggles firing on/off
+var enter_down := false
+var enter_t := 0.0
+var enter_long := false
+var xoff := 0.0                 # extra width on each side of the 720 px core (tablets, TV)
+var chunk_cols := -1
+var tv_mode := false
+var supply_ready := false
+var picking := false
+var pick_t := 0.0
+var pick_focus := 0
+var menu_focus := 0
+var music_on := true
+var sfx_on := true
+var autotest := false
+var at_t := 0.0
+var at_step := 0
+# audio
+var snd := {}
+var sfx_players: Array = []
+var sfx_next := 0
+var sfx_last := {}
+var music_tracks := {}
+var music_a: AudioStreamPlayer
+var music_b: AudioStreamPlayer
+var music_cur := ""
+var music_fade := 1.0
+var laser_player: AudioStreamPlayer
+var beep_t := 0.0
 
 # terrain generator (one entry per row)
 var rows_c := PackedFloat32Array()   # river centre
@@ -386,6 +418,10 @@ func _ready() -> void:
 	ui_font = sf
 	texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	randomize()
+	get_tree().quit_on_go_back = false
+	autotest = OS.get_cmdline_user_args().has("--autotest")
+	_setup_orientation()
+	_setup_audio()
 	_load_best()
 	_reset()
 	state = State.TITLE
@@ -393,9 +429,50 @@ func _ready() -> void:
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_APPLICATION_FOCUS_OUT or what == NOTIFICATION_APPLICATION_PAUSED:
-		if state == State.PLAY:
-			state = State.PAUSED
-			touching = false
+		if state == State.PLAY and not autotest:
+			_pause()
+	elif what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		_back()
+
+
+func _setup_orientation() -> void:
+	# phones stay portrait; tablets may rotate; TVs are landscape
+	if not (OS.has_feature("android") or OS.has_feature("ios")):
+		return
+	if not DisplayServer.is_touchscreen_available():
+		tv_mode = true
+		DisplayServer.screen_set_orientation(DisplayServer.SCREEN_SENSOR_LANDSCAPE)
+		return
+	var px_size := Vector2(DisplayServer.screen_get_size())
+	var dpi := float(maxi(DisplayServer.screen_get_dpi(), 1))
+	if px_size.length() / dpi >= 7.0:
+		DisplayServer.screen_set_orientation(DisplayServer.SCREEN_SENSOR)
+	else:
+		DisplayServer.screen_set_orientation(DisplayServer.SCREEN_PORTRAIT)
+
+
+func _pause() -> void:
+	if state == State.PLAY:
+		state = State.PAUSED
+		touching = false
+		enter_down = false
+		menu_focus = 0
+		_sfx("tap")
+
+
+func _back() -> void:
+	match state:
+		State.PLAY:
+			if picking:
+				picking = false
+			else:
+				_pause()
+		State.PAUSED:
+			state = State.PLAY
+		State.DEAD:
+			state = State.TITLE
+		State.TITLE:
+			get_tree().quit()
 
 
 func _reset() -> void:
@@ -458,6 +535,9 @@ func _reset() -> void:
 	land_fired = false
 	slots = []
 	sel = 0
+	supply_ready = false
+	picking = false
+	fire_latch = false
 	shield_hp = 0.0
 	shield_fx = 0.0
 	spec_t = 0.0
@@ -656,14 +736,38 @@ func _spawn_kit(r: int, span: Vector2, cx: float) -> void:
 
 
 func _add_supply(pts: float) -> void:
+	if supply_ready:
+		return
 	supply += pts
 	if supply >= supply_need:
-		supply -= supply_need
-		supply_need = minf(supply_need + SUPPLY_STEP, SUPPLY_MAX)
-		_supply_drop()
+		supply = supply_need
+		supply_ready = true
+		toasts.append({"text": "SUPPLY READY! TAP TO CHOOSE", "life": 2.4})
+		_sfx("supply_ready")
+		_buzz(60)
 
 
-func _supply_drop() -> void:
+func _open_picker() -> void:
+	if not supply_ready or picking:
+		return
+	picking = true
+	pick_t = 6.0
+	pick_focus = 0
+	_sfx("tap")
+
+
+func _pick_choose(i: int) -> void:
+	if not picking:
+		return
+	i = clampi(i, 0, maxi(unlocked - 1, 0))
+	picking = false
+	supply_ready = false
+	supply = 0.0
+	supply_need = minf(supply_need + SUPPLY_STEP, SUPPLY_MAX)
+	_supply_drop(String(UNLOCKS[i][0]))
+
+
+func _supply_drop(choice := "") -> void:
 	# a crate parachutes onto the river just above the top of the screen
 	var w := dist + anchor_y + 160.0
 	for b in bridges:
@@ -679,7 +783,7 @@ func _supply_drop() -> void:
 	var pool: Array = []
 	for i in unlocked:
 		pool.append(UNLOCKS[i][0])
-	var id: String = pool[randi() % pool.size()]
+	var id: String = pool[randi() % pool.size()] if choice == "" else choice
 	wcrates.append({"x": x, "w": r * ROW + ROW * 0.5, "id": id, "size": Vector2(60, 64), "dead": false})
 	toasts.append({"text": "SUPPLY DROP: " + String(SPECIALS[id]["name"]), "life": 2.4})
 	_buzz(40)
@@ -690,6 +794,7 @@ func _check_unlocks() -> void:
 		var nm: String = SPECIALS[UNLOCKS[unlocked][0]]["name"]
 		unlocked += 1
 		toasts.append({"text": "UNLOCKED: " + nm, "life": 2.6})
+		_sfx("unlock")
 		_buzz(60)
 
 
@@ -758,10 +863,12 @@ func _spawn_ground(r: int, span: Vector2, kind: String) -> void:
 			pts = 80
 	var need := size.x + 24.0
 	var opts: Array = []
-	if span.x >= need:
-		opts.append(Vector2(12.0 + size.x * 0.5, span.x - 12.0 - size.x * 0.5))
-	if VW - span.y >= need:
-		opts.append(Vector2(span.y + 12.0 + size.x * 0.5, VW - 12.0 - size.x * 0.5))
+	var lmin := maxf(12.0 - xoff, span.x - 300.0)
+	var rmax := minf(VW - 12.0 + xoff, span.y + 300.0)
+	if span.x - lmin >= need:
+		opts.append(Vector2(lmin + size.x * 0.5, span.x - 12.0 - size.x * 0.5))
+	if rmax - span.y >= need:
+		opts.append(Vector2(span.y + 12.0 + size.x * 0.5, rmax - size.x * 0.5))
 	if opts.is_empty():
 		return
 	var o: Vector2 = opts[randi() % opts.size()]
@@ -800,7 +907,7 @@ func _spawn_enemy(r: int, span: Vector2) -> void:
 	var dir := 1.0 if randf() < 0.5 else -1.0
 	var x := (span.x + span.y) * 0.5
 	if kind == "jet":
-		x = -60.0 if dir > 0.0 else VW + 60.0
+		x = -60.0 - xoff if dir > 0.0 else VW + 60.0 + xoff
 	elif span.y - span.x > size.x + 8.0:
 		x = randf_range(span.x + size.x * 0.5, span.y - size.x * 0.5)
 	enemies.append(_mk_enemy(kind, x, r * ROW + ROW * 0.5, spd * dir, hp, size, pts))
@@ -863,8 +970,20 @@ func _hash(a: int, b: int) -> int:
 func _process(delta: float) -> void:
 	var dt := minf(delta, 0.05)
 	t += dt
-	vh = get_viewport_rect().size.y
+	var vsize := get_viewport_rect().size
+	vh = vsize.y
+	xoff = maxf((vsize.x - VW) * 0.5, 0.0)
 	anchor_y = vh - 330.0
+	if autotest:
+		_autotest(dt)
+	# TV remote: holding OK switches weapon (or opens the supply picker)
+	if enter_down and not enter_long and t - enter_t > 0.45:
+		enter_long = true
+		if state == State.PLAY:
+			if supply_ready:
+				_open_picker()
+			elif slots.size() > 1:
+				_select_slot((sel + 1) % slots.size())
 	if state == State.TITLE:
 		plane_y = anchor_y
 	plane_y = clampf(plane_y, _ymin(), _ymax())
@@ -872,13 +991,20 @@ func _process(delta: float) -> void:
 	shake_vec = Vector2.ZERO
 	if shake > 0.1 and state != State.PAUSED:
 		shake_vec = Vector2(randf_range(-shake, shake), randf_range(-shake, shake))
+	var gdt := dt
+	if picking and state == State.PLAY:
+		gdt = dt * 0.3                 # slow motion while choosing a supply drop
+		pick_t -= dt
+		if pick_t <= 0.0:
+			_pick_choose(randi() % maxi(unlocked, 1))
 	match state:
 		State.PLAY:
-			_update_play(dt)
+			_update_play(gdt)
 		State.DEAD:
 			dead_t += dt
 	if state != State.PAUSED:
-		_update_fx(dt)
+		_update_fx(gdt)
+	_update_audio(dt)
 	_update_chunks()
 	queue_redraw()
 
@@ -886,20 +1012,24 @@ func _process(delta: float) -> void:
 func _update_play(dt: float) -> void:
 	# flying: keyboard (the finger/mouse is handled in _input)
 	var kb := Vector2.ZERO
-	if Input.is_key_pressed(KEY_LEFT) or Input.is_key_pressed(KEY_A):
-		kb.x -= 1.0
-	if Input.is_key_pressed(KEY_RIGHT) or Input.is_key_pressed(KEY_D):
-		kb.x += 1.0
-	if Input.is_key_pressed(KEY_UP) or Input.is_key_pressed(KEY_W):
-		kb.y -= 1.0
-	if Input.is_key_pressed(KEY_DOWN) or Input.is_key_pressed(KEY_S):
-		kb.y += 1.0
-	px = clampf(px + kb.x * 560.0 * dt, 20.0, VW - 20.0)
+	if not picking:
+		kb = Input.get_vector("ui_left", "ui_right", "ui_up", "ui_down", 0.2)
+		if Input.is_key_pressed(KEY_A):
+			kb.x -= 1.0
+		if Input.is_key_pressed(KEY_D):
+			kb.x += 1.0
+		if Input.is_key_pressed(KEY_W):
+			kb.y -= 1.0
+		if Input.is_key_pressed(KEY_S):
+			kb.y += 1.0
+		kb = kb.limit_length(1.0)
+	px = clampf(px + kb.x * 560.0 * dt, 20.0 - xoff, VW - 20.0 + xoff)
 	plane_y = clampf(plane_y + kb.y * 520.0 * dt, _ymin(), _ymax())
 	var pp := Vector2(px, plane_y)
 	pvel = pvel.lerp((pp - last_ppos) / dt, clampf(dt * 8.0, 0.0, 1.0))
 	last_ppos = pp
-	firing = touching or Input.is_key_pressed(KEY_SPACE)
+	firing = touching or fire_latch or Input.is_key_pressed(KEY_SPACE) \
+		or Input.is_joy_button_pressed(0, JOY_BUTTON_A) or Input.get_joy_axis(0, JOY_AXIS_TRIGGER_RIGHT) > 0.5
 
 	var base := minf(290.0 + float(stage) * 20.0 + 30.0 * clampf(stage_clock / STAGE_TIME, 0.0, 1.0), 470.0)
 	speed = move_toward(speed, base, 600.0 * dt)
@@ -920,6 +1050,7 @@ func _update_play(dt: float) -> void:
 			var got := minf(DEPOT_REFILL, max_fuel - fuel)
 			fuel += got
 			_popup("+" + str(int(round(got))) + " FUEL", d["x"], _sy(d["w"]) - 60.0, 4.0, C_CYAN)
+			_sfx("fuel")
 			_burst(d["x"], d["w"], [C_CYAN, Color.WHITE], 10, 0.6)
 			_buzz(30)
 	for c in wcrates:
@@ -934,6 +1065,7 @@ func _update_play(dt: float) -> void:
 			var amt: int = k["amt"]
 			health = minf(100.0, health + float(amt))
 			_popup("+" + str(amt) + "% LIFE", k["x"], _sy(k["w"]) - 60.0, 4.0, Color("#86efac"))
+			_sfx("life")
 			_burst(k["x"], k["w"], [C_SAFE, Color.WHITE], 12, 0.7)
 			_buzz(30)
 	fuel = minf(fuel, max_fuel)
@@ -1002,6 +1134,7 @@ func _update_play(dt: float) -> void:
 					invuln = 0.9
 					_flash(px, pw, 50.0)
 					_popup("LASER!", px, plane_y - 80.0, 4.0, C_RED)
+					_sfx("zap")
 					break
 			if invuln > 0.0:
 				break
@@ -1062,6 +1195,7 @@ func _start_fort() -> void:
 	fort_clock = 0.0
 	next_fort = randf_range(55.0, 75.0)
 	_banner("FORTIFIED ZONE", "Only the green corridor is safe", C_SAFE)
+	_sfx("warning", -6.0)
 	_buzz(80)
 
 
@@ -1076,6 +1210,7 @@ func _start_battle() -> void:
 	slots = slots.filter(func(sl): return not sl["war"])
 	slots.append({"id": "rail", "energy": 100.0, "war": true})
 	sel = slots.size() - 1
+	_sfx("warning")
 	_banner("WARNING: BATTLEFIELD", "Survive " + str(int(BATTLE_TIME)) + "s. Shield + Thunder Railgun online", C_RED)
 	shake += 10.0
 	_buzz(250)
@@ -1099,6 +1234,7 @@ func _end_battle() -> void:
 	shield_hp = 0.0
 	slots = slots.filter(func(sl): return not sl["war"])
 	sel = clampi(sel, 0, maxi(slots.size() - 1, 0))
+	_sfx("stage_clear")
 	_banner("STAGE CLEAR! +" + _fmt(bonus), "Next: " + String(BIOMES[gen_biome]["name"]) + "   +30% life", C_GOLD)
 	_buzz(150)
 
@@ -1123,6 +1259,7 @@ func _update_weapons(dt: float) -> void:
 		fire_t = 0.16
 		if id != "spread":
 			_bullet(px, pw + 34.0, 0.0, false)
+			_sfx("cannon", -8.0, 0.08)
 	if id == "":
 		return
 	match id:
@@ -1131,6 +1268,7 @@ func _update_weapons(dt: float) -> void:
 				spec_t = 0.16
 				for a in [-0.3, -0.15, 0.0, 0.15, 0.3]:
 					_bullet(px + a * 40.0, pw + 30.0, sin(a) * 1250.0, false)
+				_sfx("spread", -6.0, 0.08)
 				_drain(sp, SPECIALS[id]["drain"])
 		"laser":
 			laser_on = true
@@ -1140,32 +1278,38 @@ func _update_weapons(dt: float) -> void:
 			if spec_t <= 0.0:
 				spec_t = 0.45
 				missiles.append({"x": px, "w": pw + 10.0, "vx": randf_range(-240.0, 240.0), "vw": speed + 250.0, "target": null, "life": 3.0, "dead": false})
+				_sfx("homing", -6.0)
 				_drain(sp, SPECIALS[id]["drain"])
 		"rockets":
 			if spec_t <= 0.0:
 				spec_t = 0.6
 				rockets.append({"x": px, "w": pw + 30.0, "vw": speed + 900.0, "life": 0.75, "dead": false, "smoke_t": 0.0})
+				_sfx("rocket", -4.0)
 				_drain(sp, SPECIALS[id]["drain"])
 		"wingmen":
 			if spec_t <= 0.0:
 				spec_t = 0.2
 				_bullet(px - 80.0, pw - 10.0, 0.0, true)
 				_bullet(px + 80.0, pw - 10.0, 0.0, true)
+				_sfx("wing", -9.0, 0.1)
 		"drones":
 			if spec_t <= 0.0:
 				spec_t = 0.25
 				var dp: Vector2 = _drone_pos(randi() % 3)
 				_bullet(dp.x, _wy(dp.y), 0.0, true)
+				_sfx("drone", -10.0, 0.15)
 		"emp":
 			# only blasts when something is close, so holding fire doesn't waste it
 			if emp_cd <= 0.0 and _emp_has_targets():
 				emp_cd = 1.2
 				_emp_blast()
+				_sfx("emp")
 				_drain(sp, SPECIALS[id]["drain"])
 		"rail":
 			if spec_t <= 0.0:
 				spec_t = 0.3
 				_fire_rail()
+				_sfx("rail", -3.0)
 				_drain(sp, SPECIALS[id]["drain"])
 
 
@@ -1191,7 +1335,7 @@ func _update_enemies(dt: float) -> void:
 			e["x"] += e["vx"] * dt
 			var hw: float = e["size"].x * 0.5
 			if kind == "jet":
-				if e["x"] < -120.0 or e["x"] > VW + 120.0:
+				if e["x"] < -120.0 - xoff or e["x"] > VW + 120.0 + xoff:
 					e["dead"] = true
 			else:
 				var span := _water_span(_row_of(e["w"]))
@@ -1283,21 +1427,19 @@ func _enemy_fire(e: Dictionary, sy: float, dt: float) -> void:
 
 
 func _eshot(x: float, sy: float, kind: String, dmg: float, any_dir: bool) -> void:
-	var spd := 520.0
+	# aimed at where the jet IS (no leading) and flying straight, so a sidestep dodges it
+	var spd := 400.0
 	if kind == "shell":
-		spd = 340.0
+		spd = 290.0
 	elif kind == "flak":
-		spd = 680.0
-	spd += 20.0 * float(stage)
+		spd = 470.0
+	spd += 12.0 * float(stage)
 	var from := Vector2(x, sy)
 	var target := Vector2(px, plane_y)
-	var lead := from.distance_to(target) / spd
-	target += pvel * lead * 0.6
 	var dir := (target - from).normalized()
 	if not any_dir and dir.y < 0.2:
 		return
-	if kind != "shell":
-		dir = dir.rotated(randf_range(-0.07, 0.07))
+	dir = dir.rotated(randf_range(-0.09, 0.09))
 	eshots.append({"x": x, "sy": sy, "vx": dir.x * spd, "vy": dir.y * spd, "kind": kind, "dmg": dmg, "dead": false})
 
 
@@ -1325,7 +1467,7 @@ func _sam_update(e: Dictionary, sy: float, dt: float) -> void:
 		e["cool"] = randf_range(2.8, 4.2)
 		var dir := (to - from).normalized()
 		emissiles.append({"x": from.x, "sy": from.y, "vx": dir.x * 220.0, "vy": dir.y * 220.0,
-			"spd": 360.0 + 20.0 * float(stage), "life": 5.5, "decoy": null, "dead": false, "smoke_t": 0.0})
+			"spd": 320.0 + 15.0 * float(stage), "life": 4.5, "decoy": null, "dead": false, "smoke_t": 0.0})
 		_flash(e["x"], e["w"], 40.0)
 		_buzz(60)
 
@@ -1363,7 +1505,7 @@ func _update_eshots(dt: float) -> void:
 	for s in eshots:
 		s["x"] += s["vx"] * dt
 		s["sy"] += s["vy"] * dt
-		if s["sy"] > vh + 40.0 or s["sy"] < -60.0 or s["x"] < -60.0 or s["x"] > VW + 60.0:
+		if s["sy"] > vh + 40.0 or s["sy"] < -60.0 or s["x"] < -60.0 - xoff or s["x"] > VW + 60.0 + xoff:
 			s["dead"] = true
 			continue
 		var big: bool = s["kind"] == "shell"
@@ -1422,8 +1564,12 @@ func _update_emissiles(dt: float) -> void:
 		if lethal:
 			if not m["lost"]:
 				v = v.lerp((tgt - pos).normalized() * spd, clampf(dt * 7.0, 0.0, 1.0)).normalized() * minf(v.length() + 1500.0 * dt, spd)
-		else:
-			v = v.lerp((tgt - pos).normalized() * spd, clampf(dt * 2.2, 0.0, 1.0)).normalized() * minf(v.length() + 500.0 * dt, spd)
+		elif not m.get("dumb", false):
+			# guided, but turns slowly and loses track after a sharp dodge
+			var want := tgt - pos
+			if dec == null and pos.distance_to(pc) < 260.0 and absf(v.angle_to(want)) > 1.0:
+				m["dumb"] = true
+			v = v.lerp(want.normalized() * spd, clampf(dt * 1.3, 0.0, 1.0)).normalized() * minf(v.length() + 400.0 * dt, spd)
 		m["vx"] = v.x
 		m["vy"] = v.y
 		m["x"] += v.x * dt
@@ -1487,12 +1633,14 @@ func _launch_land_missile() -> void:
 		"spd": 1000.0, "life": 3.0, "decoy": null, "dead": false, "smoke_t": 0.0,
 		"lethal": true, "lost": false})
 	_popup("GROUND MISSILE!", px, plane_y - 100.0, 4.0, C_RED)
+	_sfx("alarm")
 	shake += 4.0
 	_buzz(120)
 
 
 func _missile_pop(m: Dictionary, big: bool) -> void:
 	m["dead"] = true
+	_sfx("explode", -2.0 if big else -8.0)
 	var w := _wy(m["sy"])
 	_burst(m["x"], w, [Color("#ffb347"), Color("#ff5a1f"), Color("#e5e7eb")], 14 if big else 8, 0.7)
 	_flash(m["x"], w, 60.0 if big else 34.0)
@@ -1511,6 +1659,7 @@ func _deploy_flares() -> void:
 		if m["decoy"] == null and not m.get("lethal", false) and Vector2(m["x"], m["sy"]).distance_to(Vector2(px, plane_y)) < 420.0:
 			m["decoy"] = pts[randi() % pts.size()]
 	_popup("FLARES!", px, plane_y - 84.0, 3.5, C_CYAN)
+	_sfx("flare")
 	_buzz(40)
 
 
@@ -1532,6 +1681,7 @@ func _update_strikes(dt: float) -> void:
 		s["t"] -= dt
 		if s["t"] <= 0.0:
 			_flash(s["x"], s["w"], 95.0)
+			_sfx("explode", -4.0)
 			_burst(s["x"], s["w"], [Color("#ffb347"), Color("#ff5a1f"), Color("#4b4b4b"), Color.WHITE], 16, 1.0)
 			shake += 5.0
 			if invuln <= 0.0 and Vector2(px - s["x"], pw - s["w"]).length() < 80.0:
@@ -1550,12 +1700,14 @@ func _damage(amount: float) -> void:
 		shield_hp -= absorb
 		a -= absorb
 		shield_fx = 0.3
+		_sfx("shield")
 		if shield_hp <= 0.0:
 			_popup("SHIELD DOWN!", px, plane_y - 110.0, 3.5, C_CYAN)
 		if a <= 0.0:
 			return
 	health -= a
 	hurt_t = 0.25
+	_sfx("hurt")
 	shake += 3.0 + a * 0.4
 	_buzz(int(20.0 + a * 4.0))
 	if a >= 2.0:
@@ -1691,6 +1843,7 @@ func _kill_enemy(e: Dictionary) -> void:
 			big = 90.0
 	_burst(e["x"], e["w"], cols, 18, 1.0)
 	_flash(e["x"], e["w"], big)
+	_sfx("explode_big" if big > 80.0 else "explode", -2.0)
 	_spawn_coins(e["x"], e["w"], 3)
 	_popup("+" + str(pts), e["x"], _sy(e["w"]) - 44.0, 4.0, C_GOLD)
 	shake += 4.0
@@ -1715,6 +1868,7 @@ func _destroy_bridge(b: Dictionary) -> void:
 	_flash(px, b["w"], 150.0)
 	_flash(clampf(px - 200.0, 60.0, VW - 60.0), b["w"], 80.0)
 	_flash(clampf(px + 200.0, 60.0, VW - 60.0), b["w"], 80.0)
+	_sfx("explode_big")
 	popups.append({"text": "BRIDGE DOWN! +500", "x": VW * 0.5, "sy": _sy(b["w"]) + 70.0, "life": 1.4, "px": 4.0, "col": C_INK, "badge": true})
 	shake += 18.0
 	_buzz(120)
@@ -1726,6 +1880,8 @@ func _die(reason: String) -> void:
 		return
 	state = State.DEAD
 	death_reason = reason
+	_sfx("explode_big")
+	_sfx("gameover", -3.0)
 	dead_t = 0.0
 	touching = false
 	var pw := _pw()
@@ -1763,6 +1919,7 @@ func _drain(sp: Dictionary, amount: float) -> void:
 func _pickup_weapon(id: String) -> void:
 	weapons_got += 1
 	var nm: String = SPECIALS[id]["name"]
+	_sfx("weapon")
 	_buzz(50)
 	for i in slots.size():
 		if slots[i]["id"] == id:
@@ -1791,6 +1948,7 @@ func _pickup_weapon(id: String) -> void:
 func _select_slot(i: int) -> void:
 	if i >= 0 and i < slots.size() and i != sel:
 		sel = i
+		_sfx("tap")
 		_popup(String(SPECIALS[slots[i]["id"]]["name"]), px, plane_y - 90.0, 3.0, SPECIALS[slots[i]["id"]]["col"])
 		_buzz(20)
 
@@ -1946,6 +2104,7 @@ func _update_rockets(dt: float) -> void:
 
 func _rocket_boom(x: float, w: float) -> void:
 	_flash(x, w, 95.0)
+	_sfx("explode", -3.0)
 	_burst(x, w, [Color("#ffb347"), Color("#ff5a1f"), Color("#ffd166"), Color.WHITE], 16, 1.0)
 	shake += 4.0
 	for e in enemies:
@@ -2069,8 +2228,17 @@ func _buzz(ms: int) -> void:
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
+		var pos: Vector2 = event.position - Vector2(xoff, 0.0)
 		if event.pressed and state == State.PLAY:
-			var si := _slot_at(event.position)
+			if picking:
+				var pi := _pick_at(pos)
+				if pi >= 0:
+					_pick_choose(pi)
+					return
+			elif supply_ready and _supply_rect().grow(8.0).has_point(pos):
+				_open_picker()
+				return
+			var si := _slot_at(pos)
 			if si >= 0:
 				_select_slot(si)
 				return
@@ -2078,68 +2246,405 @@ func _input(event: InputEvent) -> void:
 			return
 		if event.pressed:
 			touching = true
-			_on_tap(event.position)
+			_on_tap(pos)
 		else:
 			touching = false
 	elif event is InputEventScreenDrag:
 		if event.index != 0:
 			return
-		if state == State.PLAY:
-			px = clampf(px + event.relative.x * STEER_SENS, 20.0, VW - 20.0)
+		if state == State.PLAY and not picking:
+			px = clampf(px + event.relative.x * STEER_SENS, 20.0 - xoff, VW - 20.0 + xoff)
 			plane_y = clampf(plane_y + event.relative.y * STEER_SENS, _ymin(), _ymax())
-	elif event is InputEventKey and event.pressed and not event.echo:
-		if event.keycode == KEY_SPACE or event.keycode == KEY_ENTER:
-			_on_tap(Vector2(-1000.0, -1000.0))
-		elif state == State.PLAY and (event.keycode == KEY_Q or event.keycode == KEY_TAB):
+	elif event is InputEventJoypadButton:
+		if event.pressed:
+			_pad_button(event.button_index)
+	elif event is InputEventKey:
+		var key: Key = event.keycode
+		var is_ok := key == KEY_ENTER or key == KEY_KP_ENTER
+		if not event.pressed:
+			if is_ok and enter_down:
+				enter_down = false
+				if not enter_long and state == State.PLAY and not picking:
+					fire_latch = not fire_latch
+					_popup("AUTO FIRE " + ("ON" if fire_latch else "OFF"), px, plane_y - 110.0, 3.5, C_GOLD)
+			return
+		if event.echo:
+			return
+		if key == KEY_BACK:
+			_back()
+			return
+		if state == State.PAUSED:
+			_menu_key(event)
+			return
+		if state == State.PLAY and picking:
+			if event.is_action_pressed("ui_left"):
+				pick_focus = posmod(pick_focus - 1, unlocked)
+			elif event.is_action_pressed("ui_right"):
+				pick_focus = posmod(pick_focus + 1, unlocked)
+			elif is_ok or key == KEY_SPACE or key == KEY_E:
+				_pick_choose(pick_focus)
+			elif key == KEY_ESCAPE:
+				picking = false
+			return
+		if is_ok:
+			if state == State.PLAY:
+				enter_down = true
+				enter_t = t
+				enter_long = false
+			else:
+				_on_tap(Vector2(-1000.0, -1000.0))
+			return
+		if key == KEY_SPACE:
+			if state != State.PLAY:
+				_on_tap(Vector2(-1000.0, -1000.0))
+		elif key == KEY_P or key == KEY_ESCAPE:
+			_pause()
+		elif state == State.PLAY and (key == KEY_Q or key == KEY_TAB):
 			if slots.size() > 1:
 				_select_slot((sel + 1) % slots.size())
-		elif state == State.PLAY and event.keycode >= KEY_1 and event.keycode <= KEY_3:
-			_select_slot(int(event.keycode - KEY_1))
-		elif event.keycode == KEY_P or event.keycode == KEY_ESCAPE:
-			if state == State.PLAY:
-				state = State.PAUSED
-			elif state == State.PAUSED:
-				state = State.PLAY
+		elif state == State.PLAY and key == KEY_E:
+			_open_picker()
+		elif state == State.PLAY and key >= KEY_1 and key <= KEY_3:
+			_select_slot(int(key - KEY_1))
 		elif state == State.PLAY and OS.is_debug_build():
-			match event.keycode:
+			match key:
 				KEY_B:
 					_debug_skip_to_bridge()
 				KEY_F:
-					if mode == Mode.CRUISE and gen_mode == Mode.CRUISE:
-						_start_fort()
+					_test_action("fort")
 				KEY_N:
-					if mode == Mode.CRUISE:
-						stage_clock = STAGE_TIME - 0.5
-						if gen_mode == Mode.FORT:
-							gen_mode = Mode.CRUISE
+					_test_action("battle")
 				KEY_M:
-					if mode == Mode.BATTLE:
-						battle_t = 0.1
+					_test_action("endbattle")
 				KEY_K:
-					gen_biome = (gen_biome + 1) % BIOMES.size()
+					_test_action("scenery")
 				KEY_J:
 					_pickup_weapon(CRATE_POOL[randi() % CRATE_POOL.size()])
 				KEY_H:
-					_supply_drop()
+					_test_action("supply")
 				KEY_G:
-					god = not god
-					_popup("GOD MODE " + ("ON" if god else "OFF"), VW * 0.5, plane_y - 120.0, 4.0, C_GOLD)
+					_test_action("god")
+
+
+func _pad_button(b: int) -> void:
+	match state:
+		State.TITLE, State.DEAD:
+			if b == JOY_BUTTON_A or b == JOY_BUTTON_START:
+				_on_tap(Vector2(-1000.0, -1000.0))
+		State.PAUSED:
+			if b == JOY_BUTTON_A:
+				_menu_activate(menu_focus)
+			elif b == JOY_BUTTON_B or b == JOY_BUTTON_START:
+				state = State.PLAY
+			elif b == JOY_BUTTON_DPAD_UP:
+				menu_focus = posmod(menu_focus - 1, _menu_items().size())
+			elif b == JOY_BUTTON_DPAD_DOWN:
+				menu_focus = posmod(menu_focus + 1, _menu_items().size())
+		State.PLAY:
+			if picking:
+				if b == JOY_BUTTON_DPAD_LEFT:
+					pick_focus = posmod(pick_focus - 1, unlocked)
+				elif b == JOY_BUTTON_DPAD_RIGHT:
+					pick_focus = posmod(pick_focus + 1, unlocked)
+				elif b == JOY_BUTTON_A or b == JOY_BUTTON_Y:
+					_pick_choose(pick_focus)
+				elif b == JOY_BUTTON_B:
+					picking = false
+			elif b == JOY_BUTTON_X or b == JOY_BUTTON_RIGHT_SHOULDER:
+				if slots.size() > 1:
+					_select_slot((sel + 1) % slots.size())
+			elif b == JOY_BUTTON_Y:
+				_open_picker()
+			elif b == JOY_BUTTON_START or b == JOY_BUTTON_BACK:
+				_pause()
+
+
+func _menu_key(event: InputEventKey) -> void:
+	var n := _menu_items().size()
+	if event.is_action_pressed("ui_up"):
+		menu_focus = posmod(menu_focus - 1, n)
+	elif event.is_action_pressed("ui_down"):
+		menu_focus = posmod(menu_focus + 1, n)
+	elif event.keycode == KEY_ENTER or event.keycode == KEY_KP_ENTER or event.keycode == KEY_SPACE:
+		_menu_activate(menu_focus)
+	elif event.keycode == KEY_P or event.keycode == KEY_ESCAPE:
+		state = State.PLAY
 
 
 func _on_tap(pos: Vector2) -> void:
 	match state:
 		State.TITLE:
+			_sfx("tap")
 			_start_run()
 		State.DEAD:
 			if dead_t > 0.7:
+				_sfx("tap")
 				_start_run()
 		State.PAUSED:
-			state = State.PLAY
-			touching = false
+			for i in _menu_items().size():
+				if _menu_rect(i).has_point(pos):
+					menu_focus = i
+					_menu_activate(i)
+					return
 		State.PLAY:
 			if _pause_rect().grow(10.0).has_point(pos):
-				state = State.PAUSED
-				touching = false
+				_pause()
+
+
+# ---------------------------------------------------------------- pause menu
+
+func _menu_items() -> Array:
+	var items: Array = [
+		["resume", "RESUME"],
+		["music", "MUSIC: " + ("ON" if music_on else "OFF")],
+		["sfx", "SOUND FX: " + ("ON" if sfx_on else "OFF")],
+	]
+	if OS.is_debug_build():
+		items.append(["battle", "TEST: BATTLEFIELD NOW"])
+		items.append(["fort", "TEST: FORTIFIED ZONE"])
+		items.append(["scenery", "TEST: NEXT SCENERY"])
+		items.append(["supply", "TEST: SUPPLY READY"])
+		items.append(["god", "TEST: GOD MODE " + ("ON" if god else "OFF")])
+	items.append(["end", "END RUN"])
+	return items
+
+
+func _menu_rect(i: int) -> Rect2:
+	return Rect2(110.0, vh * 0.2 + 120.0 + float(i) * 78.0, VW - 220.0, 64.0)
+
+
+func _menu_activate(i: int) -> void:
+	var items := _menu_items()
+	if i < 0 or i >= items.size():
+		return
+	var id: String = items[i][0]
+	_sfx("tap")
+	match id:
+		"resume":
+			state = State.PLAY
+		"music":
+			music_on = not music_on
+			_save_best()
+		"sfx":
+			sfx_on = not sfx_on
+			_save_best()
+		"end":
+			state = State.TITLE
+			if int(score) > best:
+				best = int(score)
+				_save_best()
+		_:
+			_test_action(id)
+			state = State.PLAY
+
+
+func _test_action(id: String) -> void:
+	# testing shortcuts (debug builds only): pause menu buttons and B/F/N/M/K/H/G keys
+	if not OS.is_debug_build():
+		return
+	match id:
+		"battle":
+			if mode == Mode.CRUISE:
+				stage_clock = STAGE_TIME - 0.5
+				if gen_mode == Mode.FORT:
+					gen_mode = Mode.CRUISE
+		"endbattle":
+			if mode == Mode.BATTLE:
+				battle_t = 0.1
+		"fort":
+			if mode == Mode.CRUISE and gen_mode == Mode.CRUISE:
+				_start_fort()
+		"scenery":
+			gen_biome = (gen_biome + 1) % BIOMES.size()
+		"supply":
+			supply = supply_need
+			supply_ready = true
+			_sfx("supply_ready")
+		"god":
+			god = not god
+			_popup("GOD MODE " + ("ON" if god else "OFF"), VW * 0.5, plane_y - 120.0, 4.0, C_GOLD)
+
+
+# ---------------------------------------------------------------- supply picker UI
+
+func _supply_rect() -> Rect2:
+	return Rect2(24.0, 184.0, 290.0, 56.0)
+
+
+func _pick_rect(i: int) -> Rect2:
+	var n := maxi(unlocked, 1)
+	var w := (VW - 72.0 - 8.0 * float(n - 1)) / float(n)
+	return Rect2(36.0 + float(i) * (w + 8.0), _panel_y() - 128.0, w, 96.0)
+
+
+func _pick_at(pos: Vector2) -> int:
+	for i in unlocked:
+		if _pick_rect(i).grow(4.0).has_point(pos):
+			return i
+	return -1
+
+
+# ---------------------------------------------------------------- audio
+
+func _setup_audio() -> void:
+	for nm in ["cannon", "spread", "laser", "homing", "rocket", "rail", "emp", "drone", "wing",
+			"explode", "explode_big", "hurt", "fuel", "life", "weapon", "supply_ready", "unlock",
+			"flare", "lock", "land_warn", "alarm", "shield", "zap", "tap", "stage_clear", "gameover", "warning"]:
+		var path := "res://audio/sfx/" + nm + ".wav"
+		if ResourceLoader.exists(path):
+			snd[nm] = load(path)
+	for nm in ["cruise", "fort", "battle"]:
+		var path := "res://audio/music/" + nm + ".ogg"
+		if ResourceLoader.exists(path):
+			var st = load(path)
+			if st is AudioStreamOggVorbis:
+				st.loop = true
+			music_tracks[nm] = st
+	for i in 14:
+		var pl := AudioStreamPlayer.new()
+		add_child(pl)
+		sfx_players.append(pl)
+	music_a = AudioStreamPlayer.new()
+	music_b = AudioStreamPlayer.new()
+	add_child(music_a)
+	add_child(music_b)
+	laser_player = AudioStreamPlayer.new()
+	add_child(laser_player)
+	if snd.has("laser"):
+		var ls := (snd["laser"] as AudioStreamWAV).duplicate() as AudioStreamWAV
+		ls.loop_mode = AudioStreamWAV.LOOP_FORWARD
+		ls.loop_begin = 0
+		ls.loop_end = int(ls.get_length() * float(ls.mix_rate))
+		laser_player.stream = ls
+		laser_player.volume_db = -10.0
+
+
+func _sfx(nm: String, vol := 0.0, pitch_var := 0.04) -> void:
+	if not sfx_on or not snd.has(nm) or sfx_players.is_empty():
+		return
+	# don't stack the same sound within a few milliseconds
+	var last: float = sfx_last.get(nm, -1.0)
+	if t - last < 0.035:
+		return
+	sfx_last[nm] = t
+	var pl: AudioStreamPlayer = sfx_players[sfx_next]
+	sfx_next = (sfx_next + 1) % sfx_players.size()
+	pl.stream = snd[nm]
+	pl.volume_db = vol
+	pl.pitch_scale = 1.0 + randf_range(-pitch_var, pitch_var)
+	pl.play()
+
+
+func _update_audio(dt: float) -> void:
+	# music: cruise / fortified zone / battlefield, cross-faded
+	var want := "cruise"
+	if state == State.PLAY or state == State.PAUSED:
+		var prow := _row_of(_pw())
+		if mode == Mode.BATTLE:
+			want = "battle"
+		elif rows_m[prow] == Mode.FORT or gen_mode == Mode.FORT:
+			want = "fort"
+	if not music_tracks.has(want):
+		want = ""
+	if want != music_cur:
+		music_cur = want
+		var tmp := music_a
+		music_a = music_b
+		music_b = tmp
+		if want != "":
+			music_a.stream = music_tracks[want]
+			music_a.volume_db = -40.0
+			music_a.play()
+		music_fade = 0.0
+	music_fade = minf(music_fade + dt / 1.2, 1.0)
+	var target := -9.0
+	if state == State.DEAD or state == State.TITLE:
+		target = -14.0
+	if state == State.PAUSED:
+		target = -20.0
+	if not music_on:
+		target = -80.0
+	if music_a.playing:
+		music_a.volume_db = lerpf(-40.0, target, music_fade) if music_fade < 1.0 else target
+	if music_b.playing:
+		music_b.volume_db = lerpf(target, -60.0, music_fade)
+		if music_fade >= 1.0:
+			music_b.stop()
+	# laser beam hum
+	var laser_should := laser_on and state == State.PLAY and sfx_on
+	if laser_should and not laser_player.playing and laser_player.stream != null:
+		laser_player.play()
+	elif not laser_should and laser_player.playing:
+		laser_player.stop()
+	# warning beeps: missile lock and flying over land
+	beep_t -= dt
+	if state == State.PLAY and beep_t <= 0.0:
+		if over_land and not land_fired:
+			var k := clampf(land_t / _land_limit(), 0.0, 1.0)
+			_sfx("land_warn", -4.0, 0.0)
+			beep_t = lerpf(0.4, 0.1, k)
+		elif lock_level > 0.3:
+			_sfx("lock", -6.0, 0.0)
+			beep_t = lerpf(0.35, 0.08, clampf(lock_level, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------- self-test (CI)
+
+func _autotest(dt: float) -> void:
+	# Runs when started with "-- --autotest": plays through every system quickly
+	# and quits, so the cloud build can catch script errors.
+	at_t += dt
+	var steps := [
+		[0.5, "start"], [1.5, "god"], [2.0, "weapons"], [3.0, "supply"], [3.5, "pick"],
+		[5.0, "fort"], [14.0, "battle"], [16.0, "pause"], [16.5, "menu_music"], [17.0, "resume"],
+		[24.0, "endbattle"], [26.0, "scenery"], [30.0, "scenery"], [34.0, "land"], [38.0, "done"],
+	]
+	while at_step < steps.size() and at_t >= float(steps[at_step][0]):
+		var a: String = steps[at_step][1]
+		at_step += 1
+		print("AUTOTEST step ", a, " t=", snappedf(at_t, 0.1))
+		match a:
+			"start":
+				_start_run()
+			"god":
+				god = true
+			"weapons":
+				for id in SPECIALS.keys():
+					_pickup_weapon(id)
+				for i in 3:
+					_select_slot(i)
+			"supply":
+				_test_action("supply")
+			"pick":
+				_open_picker()
+				_pick_choose(0)
+			"fort":
+				_test_action("fort")
+			"battle":
+				_test_action("battle")
+			"pause":
+				_pause()
+			"menu_music":
+				_menu_activate(1)
+				_menu_activate(1)
+			"resume":
+				state = State.PLAY
+			"endbattle":
+				_test_action("endbattle")
+			"scenery":
+				_test_action("scenery")
+			"land":
+				px = -xoff + 30.0
+			"done":
+				print("AUTOTEST OK score=", int(score), " kills=", kills, " weapons=", weapons_got)
+				get_tree().quit()
+	if state == State.PLAY:
+		touching = true
+		if int(at_t) % 2 == 0 and slots.size() > 1:
+			sel = (sel + 1) % slots.size()
+		# wiggle the jet so collisions and pickups happen
+		if at_step < 13:
+			px = 360.0 + sin(at_t * 1.7) * 120.0
 
 
 func _debug_skip_to_bridge() -> void:
@@ -2178,11 +2683,15 @@ func _load_best() -> void:
 	var cf := ConfigFile.new()
 	if cf.load("user://save.cfg") == OK:
 		best = int(cf.get_value("stats", "best", 0))
+		music_on = bool(cf.get_value("settings", "music", true))
+		sfx_on = bool(cf.get_value("settings", "sfx", true))
 
 
 func _save_best() -> void:
 	var cf := ConfigFile.new()
 	cf.set_value("stats", "best", best)
+	cf.set_value("settings", "music", music_on)
+	cf.set_value("settings", "sfx", sfx_on)
 	cf.save("user://save.cfg")
 
 
@@ -2397,7 +2906,7 @@ func _clock(sec: float) -> String:
 # ---------------------------------------------------------------- drawing
 
 func _draw() -> void:
-	shake_off = shake_vec
+	shake_off = shake_vec + Vector2(xoff, 0.0)
 	draw_set_transform(shake_off)
 	_draw_world()
 	_draw_radar_shadows()
@@ -2412,23 +2921,25 @@ func _draw() -> void:
 	_draw_eshots()
 	_draw_emissiles()
 	_draw_flashes()
-	shake_off = Vector2.ZERO
-	draw_set_transform(Vector2.ZERO)
+	shake_off = Vector2(xoff, 0.0)
+	draw_set_transform(shake_off)
+	var xl := -xoff
+	var xr := VW + xoff
 	_draw_vignette()
 	if mode == Mode.BATTLE and state == State.PLAY:
 		var ba := 0.10 + 0.06 * sin(t * 4.0)
-		draw_rect(Rect2(0.0, 0.0, 18.0, vh), Color(1, 0.15, 0.1, ba))
-		draw_rect(Rect2(VW - 18.0, 0.0, 18.0, vh), Color(1, 0.15, 0.1, ba))
+		draw_rect(Rect2(xl, 0.0, 18.0, vh), Color(1, 0.15, 0.1, ba))
+		draw_rect(Rect2(xr - 18.0, 0.0, 18.0, vh), Color(1, 0.15, 0.1, ba))
 	if over_land and state == State.PLAY:
 		var la := 0.18 + 0.14 * sin(t * 18.0)
-		draw_rect(Rect2(0.0, 0.0, 30.0, vh), Color(1, 0.05, 0.05, la))
-		draw_rect(Rect2(VW - 30.0, 0.0, 30.0, vh), Color(1, 0.05, 0.05, la))
+		draw_rect(Rect2(xl, 0.0, 30.0, vh), Color(1, 0.05, 0.05, la))
+		draw_rect(Rect2(xr - 30.0, 0.0, 30.0, vh), Color(1, 0.05, 0.05, la))
 	if hurt_t > 0.0:
 		var ha := hurt_t / 0.25 * 0.45
-		draw_rect(Rect2(0.0, 0.0, VW, 30.0), Color(1, 0.1, 0.1, ha))
-		draw_rect(Rect2(0.0, vh - 30.0, VW, 30.0), Color(1, 0.1, 0.1, ha))
-		draw_rect(Rect2(0.0, 0.0, 26.0, vh), Color(1, 0.1, 0.1, ha))
-		draw_rect(Rect2(VW - 26.0, 0.0, 26.0, vh), Color(1, 0.1, 0.1, ha))
+		draw_rect(Rect2(xl, 0.0, xr - xl, 30.0), Color(1, 0.1, 0.1, ha))
+		draw_rect(Rect2(xl, vh - 30.0, xr - xl, 30.0), Color(1, 0.1, 0.1, ha))
+		draw_rect(Rect2(xl, 0.0, 26.0, vh), Color(1, 0.1, 0.1, ha))
+		draw_rect(Rect2(xr - 26.0, 0.0, 26.0, vh), Color(1, 0.1, 0.1, ha))
 	_draw_popups()
 	if state == State.PLAY or state == State.PAUSED:
 		_draw_hud()
@@ -2451,6 +2962,13 @@ func _update_chunks() -> void:
 	var c_hi := floori(top_w / (ROW * CHUNK_ROWS))
 	_ensure_rows(maxi((c_hi + 1) * CHUNK_ROWS + 1, 0))
 	var added := false
+	var xc := int(ceil(xoff / COLW))
+	if xc != chunk_cols:
+		chunk_cols = xc
+		for k in chunks.keys():
+			chunks[k].queue_free()
+		chunks.clear()
+		wrecks.clear()
 	for k in chunks.keys():
 		if k < c_lo or k > c_hi:
 			chunks[k].queue_free()
@@ -2464,7 +2982,7 @@ func _update_chunks() -> void:
 			chunks[ci] = n
 			added = true
 		var node: Node2D = chunks[ci]
-		node.position = shake_vec + Vector2(0.0, _sy(float(ci * CHUNK_ROWS) * ROW))
+		node.position = shake_vec + Vector2(xoff, _sy(float(ci * CHUNK_ROWS) * ROW))
 	if added:
 		# far chunks first, so nearer blocks overlap them
 		var keys: Array = chunks.keys()
@@ -2517,7 +3035,7 @@ func _draw_chunk(n: Node2D, ci: int) -> void:
 		var B: Dictionary = BIOMES[rows_b[rr]]
 		var battle: bool = rows_m[rr] == Mode.BATTLE
 		var prop: String = B["prop"]
-		for col in COLS:
+		for col in range(-chunk_cols, COLS + chunk_cols):
 			if _cell_is_water(rr, col):
 				continue
 			var x := col * COLW
@@ -2716,15 +3234,17 @@ func _draw_bridges() -> void:
 		var deck := Color("#c9a27a")
 		if b["hit"] > 0.0:
 			deck = Color("#fff3d6")
-		draw_rect(Rect2(0.0, sy - 22.0, VW, 40.0), deck)
-		draw_rect(Rect2(0.0, sy + 18.0, VW, 22.0), Color("#7d5a3a"))
-		var x := 0.0
-		while x < VW:
+		var bl := -xoff - 40.0
+		var bwd := VW + 2.0 * xoff + 80.0
+		draw_rect(Rect2(bl, sy - 22.0, bwd, 40.0), deck)
+		draw_rect(Rect2(bl, sy + 18.0, bwd, 22.0), Color("#7d5a3a"))
+		var x := floorf(bl / 40.0) * 40.0
+		while x < bl + bwd:
 			draw_rect(Rect2(x, sy - 22.0, 3.0, 40.0), Color("#a77d55"))
 			draw_rect(Rect2(x + 2.0, sy + 18.0, 2.0, 22.0), Color("#5e4129"))
 			x += 40.0
-		draw_rect(Rect2(0.0, sy - 22.0, VW, 6.0), Color("#e3c39d"))
-		draw_rect(Rect2(0.0, sy + 6.0, VW, 4.0), Color("#b48a63"))
+		draw_rect(Rect2(bl, sy - 22.0, bwd, 6.0), Color("#e3c39d"))
+		draw_rect(Rect2(bl, sy + 6.0, bwd, 4.0), Color("#b48a63"))
 		if b["hp"] < b["maxhp"]:
 			var fr := float(b["hp"]) / float(b["maxhp"])
 			_rrect(Rect2(VW * 0.5 - 110.0, sy - 62.0, 220.0, 22.0), Color(0.03, 0.09, 0.16, 0.8), 11.0)
@@ -3087,8 +3607,8 @@ func _draw_player() -> void:
 func _draw_vignette() -> void:
 	for i in 10:
 		var k := 1.0 - float(i) / 10.0
-		draw_rect(Rect2(0.0, float(i) * 22.0, VW, 22.0), Color(0.02, 0.07, 0.12, 0.5 * k * k))
-		draw_rect(Rect2(0.0, vh - float(i + 1) * 20.0, VW, 20.0), Color(0.02, 0.07, 0.12, 0.5 * k * k))
+		draw_rect(Rect2(-xoff, float(i) * 22.0, VW + 2.0 * xoff, 22.0), Color(0.02, 0.07, 0.12, 0.5 * k * k))
+		draw_rect(Rect2(-xoff, vh - float(i + 1) * 20.0, VW + 2.0 * xoff, 20.0), Color(0.02, 0.07, 0.12, 0.5 * k * k))
 
 
 func _draw_popups() -> void:
@@ -3100,11 +3620,11 @@ func _draw_popups() -> void:
 			var w := _ptext_width(text, pxs) + 40.0
 			var h := 7.0 * pxs + 28.0
 			var c := Vector2(p["x"], p["sy"])
-			draw_set_transform(c, deg_to_rad(-3.0))
+			draw_set_transform(Vector2(xoff, 0.0) + c, deg_to_rad(-3.0))
 			_rrect(Rect2(-w * 0.5, -h * 0.5 + 6.0, w, h), Color(0.72, 0.53, 0.04, a), 14.0)
 			_rrect(Rect2(-w * 0.5, -h * 0.5, w, h), Color(1.0, 0.82, 0.25, a), 14.0)
 			_ptext(text, Vector2(0.0, -3.5 * pxs), pxs, Color(C_INK.r, C_INK.g, C_INK.b, a), 1)
-			draw_set_transform(Vector2.ZERO)
+			draw_set_transform(Vector2(xoff, 0.0))
 		else:
 			var col: Color = p["col"]
 			col.a = a
@@ -3150,6 +3670,13 @@ func _draw_hud() -> void:
 	_rrect(sbar, Color(1, 1, 1, 0.16), 7.0)
 	_rrect(Rect2(sbar.position, Vector2(maxf(sbar.size.x * clampf(supply / supply_need, 0.0, 1.0), 10.0), sbar.size.y)), Color("#f97316"), 7.0)
 	_ptext("SUPPLY", Vector2(378.0, 125.0), 2.5, Color("#ffb347"))
+	if supply_ready and not picking:
+		var sr := _supply_rect()
+		var pulse := 0.5 + 0.5 * sin(t * 7.0)
+		_rrect(sr, Color(0.97, 0.45, 0.09, 0.75 + 0.25 * pulse), 16.0, Color(1, 1, 1, 0.6 + 0.4 * pulse), 3)
+		_ptext("SUPPLY READY", Vector2(sr.position.x + 16.0, sr.position.y + 9.0), 3.0, Color.WHITE, 0, C_INK)
+		var hint_sup := "tap to choose" if not tv_mode else "hold OK to choose"
+		_text_left(sr.position.x + 16.0, sr.position.y + 47.0, hint_sup, 15, Color.WHITE)
 	if unlocked < UNLOCKS.size():
 		var nxt: String = SPECIALS[UNLOCKS[unlocked][0]]["name"]
 		_text_left(24.0, 172.0, "Next weapon: " + nxt.capitalize() + " at " + _fmt(int(UNLOCKS[unlocked][1])), 15, Color("#cfe8ff"))
@@ -3258,10 +3785,34 @@ func _draw_hud() -> void:
 		_rrect(Rect2(tx, r.position.y + 42.0, maxf(tw * e, 8.0), 14.0), scol if e > 0.2 else C_RED, 7.0)
 		if sl["war"]:
 			_ptext("WAR", Vector2(r.end.x - 8.0, r.position.y + 6.0), 2.0, C_GOLD, 2)
+	if picking:
+		var top := _panel_y() - 186.0
+		_rrect(Rect2(24.0, top, VW - 48.0, 172.0), Color(0.03, 0.094, 0.157, 0.94), 22.0, Color(0.97, 0.45, 0.09, 1.0), 3)
+		_ptext("CHOOSE YOUR SUPPLY DROP", Vector2(VW * 0.5, top + 14.0), 3.0, Color("#ffb347"), 1)
+		_rrect(Rect2(60.0, top + 42.0, (VW - 120.0) * clampf(pick_t / 6.0, 0.0, 1.0), 6.0), Color("#ffb347"), 3.0)
+		for i in unlocked:
+			var r := _pick_rect(i)
+			var pid: String = UNLOCKS[i][0]
+			var pd: Dictionary = SPECIALS[pid]
+			var pc: Color = pd["col"]
+			var foc := i == pick_focus and (tv_mode or not DisplayServer.is_touchscreen_available())
+			_rrect(r, Color(pc.r, pc.g, pc.b, 0.22), 12.0, C_GOLD if foc else Color(1, 1, 1, 0.3), 4 if foc else 1)
+			var ib := Rect2(r.get_center().x - 22.0, r.position.y + 8.0, 44.0, 44.0)
+			_rrect(ib, pc, 10.0)
+			_ptext(String(pd["icon"]), Vector2(ib.get_center().x, ib.position.y + 8.0), 4.0, Color.WHITE, 1, C_INK)
+			var short: String = String(pd["name"]).split(" ")[0]
+			var fs := 15
+			while fs > 10 and _text_w(short, fs) > r.size.x - 6.0:
+				fs -= 1
+			draw_string(ui_font, Vector2(r.position.x, r.position.y + 78.0), short, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, fs, Color.WHITE)
 	# hint
 	var hint := "Drag to fly. Hold to fire, lift to glide over FUEL."
-	if not slots.is_empty():
+	if tv_mode:
+		hint = "D-pad fly | OK fire on/off | hold OK switch | Back pause"
+	if not slots.is_empty() and not tv_mode:
 		hint = "Tap a weapon to switch. Hold to fire it."
+	if fire_latch:
+		hint = "AUTO FIRE ON - press OK to stop (glide over FUEL)"
 	var hint_col := Color("#cfe8ff")
 	var blink := int(t * 4.0) % 2 == 0
 	if over_land:
@@ -3286,7 +3837,7 @@ func _draw_hud() -> void:
 
 
 func _dim(a := 0.7) -> void:
-	draw_rect(Rect2(0.0, 0.0, VW, vh), Color(0.02, 0.07, 0.12, a))
+	draw_rect(Rect2(-xoff, 0.0, VW + 2.0 * xoff, vh), Color(0.02, 0.07, 0.12, a))
 
 
 func _draw_title() -> void:
@@ -3294,22 +3845,34 @@ func _draw_title() -> void:
 	var y := vh * 0.12
 	_vsprite(OTTER, Vector2(VW * 0.5, y), 10.0, OTTER_COLS, 5.0)
 	_ptext("RIVERWING", Vector2(VW * 0.5, y + 90.0), 12.0, C_GOLD, 1, Color("#8a5a00"))
-	_ptext("PROTOTYPE V0.5.1", Vector2(VW * 0.5, y + 194.0), 3.0, Color("#cfe8ff"), 1)
+	_ptext("PROTOTYPE V0.6", Vector2(VW * 0.5, y + 194.0), 3.0, Color("#cfe8ff"), 1)
 	var lines := [
 		"Drag to fly your jet anywhere on screen.",
 		"Hold to fire. Lift to glide over FUEL.",
+	]
+	if tv_mode:
+		lines = [
+			"D-pad: fly. OK: auto fire on / off.",
+			"Hold OK: switch weapon or pick supply.",
+		]
+	elif not DisplayServer.is_touchscreen_available():
+		lines = [
+			"Mouse drag or arrows/WASD to fly.",
+			"Hold Space or the mouse to fire. Q: switch.",
+		]
+	lines.append_array([
 		"Kills fill SUPPLY: a weapon crate drops in.",
 		"Fortified zones: stay in the green corridor.",
 		"Every 5 min: a battlefield. Survive 45 s.",
 		"Hide behind rocks to break missile locks.",
 		"Flares fire automatically at missiles.",
 		"Over land: 2 s, then a missile hits.",
-	]
+	])
 	_rrect(Rect2(36.0, y + 244.0, VW - 72.0, 416.0), C_PANEL, 24.0)
 	for i in lines.size():
 		_text(VW * 0.5, y + 292.0 + i * 48.0, lines[i], 24, Color.WHITE, false)
 	if int(t * 2.0) % 2 == 0:
-		_ptext("TAP TO FLY", Vector2(VW * 0.5, y + 698.0), 8.0, C_GOLD, 1, Color("#8a5a00"))
+		_ptext("PRESS OK TO FLY" if tv_mode else "TAP TO FLY", Vector2(VW * 0.5, y + 698.0), 8.0, C_GOLD, 1, Color("#8a5a00"))
 	if best > 0:
 		_ptext("BEST " + _fmt(best), Vector2(VW * 0.5, y + 778.0), 4.0, C_CYAN, 1, C_INK)
 
@@ -3336,6 +3899,17 @@ func _draw_dead() -> void:
 
 
 func _draw_paused() -> void:
-	_dim(0.6)
-	_ptext("PAUSED", Vector2(VW * 0.5, vh * 0.4), 10.0, Color.WHITE, 1, C_INK)
-	_text(VW * 0.5, vh * 0.4 + 130.0, "Tap anywhere to keep flying", 28, Color("#cfe8ff"))
+	_dim(0.72)
+	_ptext("PAUSED", Vector2(VW * 0.5, vh * 0.2), 9.0, Color.WHITE, 1, C_INK)
+	var items := _menu_items()
+	for i in items.size():
+		var r := _menu_rect(i)
+		var id: String = items[i][0]
+		var foc := i == menu_focus
+		var col := Color(1, 1, 1, 0.08)
+		if id.begins_with("battle") or id in ["fort", "scenery", "supply", "god"]:
+			col = Color(0.97, 0.45, 0.09, 0.14)
+		if id == "resume":
+			col = Color(0.29, 0.87, 0.5, 0.25)
+		_rrect(r, col, 16.0, C_GOLD if foc else Color(1, 1, 1, 0.25), 4 if foc else 1)
+		draw_string(ui_font, Vector2(r.position.x, r.position.y + 42.0), String(items[i][1]), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, 26, Color.WHITE)

@@ -77,6 +77,15 @@ jobs:
           }
           timeout 600 "$GODOT" --headless --import > import.log 2>&1 || true
           tail -n 20 import.log
+          # self-test: play through every system for ~40 game seconds, headless
+          timeout 300 "$GODOT" --headless --fixed-fps 60 --path . -- --autotest > test.log 2>&1 || true
+          cat test.log
+          if grep -qE "SCRIPT ERROR|Parse Error|Invalid call|Invalid access|Invalid operands|Invalid assignment" test.log || ! grep -q "AUTOTEST OK" test.log; then
+            grep -nE -A4 "SCRIPT ERROR|Parse Error|Invalid" test.log > errs.log || true
+            [ -s errs.log ] || tail -n 40 test.log > errs.log
+            report errs.log "Self-test failed"
+            exit 1
+          fi
           if ! "$GODOT" --headless --export-debug "Android" build/riverwing.apk > apk.log 2>&1 || [ ! -f build/riverwing.apk ]; then
             cat apk.log
             report apk.log "Android export failed"
