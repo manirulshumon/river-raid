@@ -1,0 +1,102 @@
+# Builds Riverwing in the cloud on every push to main:
+#   - riverwing.apk       install on Android phones
+#   - riverwing-web.zip   upload to itch.io for the browser version
+# Each build is published as a GitHub Release, so the newest APK is always at
+#   https://github.com/<owner>/<repo>/releases/latest
+name: Build Riverwing
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.7.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Godot and its export templates
+        run: |
+          set -e
+          BASE="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable"
+          mkdir -p "$HOME/godot"
+          cd "$HOME/godot"
+          wget -q "$BASE/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          wget -q "$BASE/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -q "Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" godot
+          chmod +x godot
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$TPL"
+          unzip -q "Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          mv templates/* "$TPL/"
+          rm -f ./*.zip ./*.tpz
+
+      - name: Tell Godot where Java and the Android SDK are
+        run: |
+          set -e
+          mkdir -p "$HOME/.config/godot"
+          for f in editor_settings-4.tres "editor_settings-${GODOT_VERSION%.*}.tres"; do
+          cat > "$HOME/.config/godot/$f" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/android_sdk_path = "${ANDROID_SDK_ROOT}"
+          EOF
+          done
+          cat "$HOME/.config/godot/editor_settings-4.tres"
+
+      - name: Export the APK and the web build
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: ${{ github.workspace }}/ci/debug.keystore
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+        run: |
+          set -e
+          GODOT="$HOME/godot/godot"
+          mkdir -p build/web
+          touch build/.gdignore
+          timeout 600 "$GODOT" --headless --import || true
+          "$GODOT" --headless --export-debug "Android" build/riverwing.apk
+          "$GODOT" --headless --export-release "Web" build/web/index.html
+          test -f build/riverwing.apk
+          test -f build/web/index.html
+          cd build/web
+          zip -q ../riverwing-web.zip index.* ./*.worklet.js
+          ls -la .. .
+
+      - name: Keep the files on this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: riverwing-build-${{ github.run_number }}
+          path: |
+            build/riverwing.apk
+            build/riverwing-web.zip
+
+      - name: Publish a release with the APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Riverwing build ${{ github.run_number }}
+          body: |
+            riverwing.apk: install on Android (allow "Install unknown apps" when asked).
+            riverwing-web.zip: upload to itch.io for the browser version.
+            Built from commit ${{ github.sha }}.
+          files: |
+            build/riverwing.apk
+            build/riverwing-web.zip

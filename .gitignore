@@ -1,0 +1,7 @@
+# Godot cache and local editor data
+.godot/
+export_credentials.cfg
+# exported builds (the GitHub Action builds these)
+build/
+*.apk
+*.aab
