@@ -1,5 +1,5 @@
-RIVERWING PROTOTYPE v0.5.1
-==========================
+RIVERWING PROTOTYPE v0.6
+========================
 
 What this is
 ------------
@@ -7,7 +7,9 @@ You fly a small stealth jet up a river. Drag to move it anywhere on screen;
 while your finger is down you fire, lift it to glide over FUEL tanks.
 - Your jet has a basic cannon. SPECIAL WEAPONS are earned: points from kills
   and bridges fill the orange SUPPLY bar under your score. When it's full a
-  weapon crate parachutes onto the river ahead: fly over it to take it.
+  SUPPLY READY button appears: tap it and choose which unlocked weapon you
+  want (the game slows down while you choose); that crate parachutes onto the
+  river ahead: fly over it to take it.
   Each drop needs a bit more than the last. New weapon types unlock as your
   score grows: Spread Gun (start), Homing Missiles 2,000, Support Jets 5,000,
   Cluster Rockets 9,000, Laser Beam 14,000, Guard Drones 20,000, EMP 27,000.
@@ -29,6 +31,15 @@ while your finger is down you fire, lift it to glide over FUEL tanks.
 - After each battlefield the scenery changes: Green Valley, Frozen North,
   Desert Storm, Jungle Delta, City River, Volcanic Front, then round again,
   harder each time.
+- SOUND: music changes for normal flying, fortified zones and the battlefield;
+  every weapon has its own sound. Music and sound effects can be turned off in
+  the pause menu (pause button, top right).
+- SCREENS: phones play in portrait. Tablets can rotate, and on wide screens
+  (tablet landscape, Android TV, desktop browser) the river stays the same and
+  the riverbanks get wider.
+- ANDROID TV remote: D-pad flies, OK turns auto fire on/off, hold OK to switch
+  weapon or choose a supply drop, Back pauses. Gamepads: stick/D-pad fly,
+  A fire, X switch weapon, Y supply drop, Start pause.
 - RIVERBANKS: you can fly over land in an emergency, but a red ring starts
   filling. After about 2.5 s a ground missile launches and one hit downs the
   jet. Get back over the river before it reaches you and it loses its lock.
@@ -44,6 +55,10 @@ Play it on your PC
    - Hold the mouse button and drag to fly and fire (works like a finger).
    - Or arrow keys / WASD to fly and hold Space to fire.
    - P or Esc pauses.
+   - Q/Tab switch weapon, E choose supply drop, P/Esc pause menu.
+   - The pause menu also has TEST buttons (battlefield now, fortified zone,
+     next scenery, supply ready, god mode) in test builds, including the APK
+     from GitHub, so you can use them on the phone.
    - Test keys (only when run from the editor):
      B = next bridge, F = fortified zone now, N = battlefield now,
      M = finish the battlefield, K = switch scenery, G = god mode,
