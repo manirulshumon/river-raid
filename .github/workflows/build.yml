@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the project
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -67,18 +67,30 @@ jobs:
           GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
           GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
         run: |
-          set -e
           GODOT="$HOME/godot/godot"
           mkdir -p build/web
           touch build/.gdignore
-          timeout 600 "$GODOT" --headless --import || true
-          "$GODOT" --headless --export-debug "Android" build/riverwing.apk
-          "$GODOT" --headless --export-release "Web" build/web/index.html
-          test -f build/riverwing.apk
-          test -f build/web/index.html
-          cd build/web
-          zip -q ../riverwing-web.zip index.* ./*.worklet.js
-          ls -la .. .
+          # on failure, show the end of Godot's log as an error on the run page
+          report() {
+            msg=$(tail -n 40 "$1" | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=$2::$msg"
+          }
+          timeout 600 "$GODOT" --headless --import > import.log 2>&1 || true
+          tail -n 20 import.log
+          if ! "$GODOT" --headless --export-debug "Android" build/riverwing.apk > apk.log 2>&1 || [ ! -f build/riverwing.apk ]; then
+            cat apk.log
+            report apk.log "Android export failed"
+            exit 1
+          fi
+          cat apk.log
+          if ! "$GODOT" --headless --export-release "Web" build/web/index.html > web.log 2>&1 || [ ! -f build/web/index.html ]; then
+            cat web.log
+            report web.log "Web export failed"
+            exit 1
+          fi
+          cat web.log
+          (cd build/web && zip -q -r ../riverwing-web.zip .)
+          ls -la build build/web
 
       - name: Keep the files on this run
         uses: actions/upload-artifact@v4
