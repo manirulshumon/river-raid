@@ -2636,7 +2636,7 @@ func _autotest(dt: float) -> void:
 			"land":
 				px = -xoff + 30.0
 			"done":
-				print("AUTOTEST OK score=", int(score), " kills=", kills, " weapons=", weapons_got)
+				print("AUTOTEST OK score=", int(score), " kills=", kills, " weapons=", weapons_got, " view=", get_viewport_rect().size, " xoff=", xoff)
 				get_tree().quit()
 	if state == State.PLAY:
 		touching = true

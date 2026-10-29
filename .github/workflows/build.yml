@@ -79,8 +79,10 @@ jobs:
           tail -n 20 import.log
           # self-test: play through every system for ~40 game seconds, headless
           timeout 300 "$GODOT" --headless --fixed-fps 60 --path . -- --autotest > test.log 2>&1 || true
+          # second pass in a wide 16:9 window (tablet / TV layout)
+          timeout 300 "$GODOT" --headless --fixed-fps 60 --resolution 1280x720 --path . -- --autotest >> test.log 2>&1 || true
           cat test.log
-          if grep -qE "SCRIPT ERROR|Parse Error|Invalid call|Invalid access|Invalid operands|Invalid assignment" test.log || ! grep -q "AUTOTEST OK" test.log; then
+          if grep -qE "SCRIPT ERROR|Parse Error|Invalid call|Invalid access|Invalid operands|Invalid assignment" test.log || [ "$(grep -c "AUTOTEST OK" test.log)" -lt 2 ]; then
             grep -nE -A4 "SCRIPT ERROR|Parse Error|Invalid" test.log > errs.log || true
             [ -s errs.log ] || tail -n 40 test.log > errs.log
             report errs.log "Self-test failed"
