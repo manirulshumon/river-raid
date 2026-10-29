@@ -2490,11 +2490,11 @@ func _setup_audio() -> void:
 	for nm in ["cannon", "spread", "laser", "homing", "rocket", "rail", "emp", "drone", "wing",
 			"explode", "explode_big", "hurt", "fuel", "life", "weapon", "supply_ready", "unlock",
 			"flare", "lock", "land_warn", "alarm", "shield", "zap", "tap", "stage_clear", "gameover", "warning"]:
-		var path := "res://audio/sfx/" + nm + ".wav"
+		var path: String = "res://audio/sfx/" + String(nm) + ".wav"
 		if ResourceLoader.exists(path):
 			snd[nm] = load(path)
 	for nm in ["cruise", "fort", "battle"]:
-		var path := "res://audio/music/" + nm + ".ogg"
+		var path: String = "res://audio/music/" + String(nm) + ".ogg"
 		if ResourceLoader.exists(path):
 			var st = load(path)
 			if st is AudioStreamOggVorbis:
