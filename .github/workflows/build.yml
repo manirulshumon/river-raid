@@ -86,6 +86,10 @@ jobs:
             report errs.log "Self-test failed"
             exit 1
           fi
+          # summary on the run page: result line plus any engine errors or warnings
+          { grep "AUTOTEST OK" test.log; grep -E "ERROR|WARNING" test.log | sort | uniq -c | sort -rn | head -n 15; } > summary.log || true
+          msg=$(sed -e 's/%/%25/g' summary.log | awk '{printf "%s%%0A", $0}')
+          echo "::notice title=Self-test passed::$msg"
           if ! "$GODOT" --headless --export-debug "Android" build/riverwing.apk > apk.log 2>&1 || [ ! -f build/riverwing.apk ]; then
             cat apk.log
             report apk.log "Android export failed"
